@@ -36,6 +36,20 @@ CAL_POWER = 25      # pivot power while measuring white and black
 CAL_SWEEP = 150     # how far it pivots each way (wheel degrees difference)
 MIN_CONTRAST = 20   # white minus black must be at least this, else the sensor is not over a line
 
+# --- Straight-line mode: faster and calmer on straight parts of the line ---
+# straight = for STRAIGHT_MS the robot hardly turns (wheel encoders: turning per distance
+# below STRAIGHT_RATIO) and stays close to the edge. Then: STRAIGHT_BOOST extra power
+# (added gradually) and a softer KP (KP * STRAIGHT_KP) against the wobble. As soon as it
+# turns or drifts off the edge (a curve begins), back to normal at once. Off near obstacles.
+# STRAIGHT_BOOST = 0 and STRAIGHT_KP = 1 turn it off.
+STRAIGHT_BOOST = 25     # extra forward power on straights
+STRAIGHT_KP = 0.6       # KP is multiplied by this on straights
+STRAIGHT_RATIO = 0.25   # straight = turning less than this per distance driven
+STRAIGHT_MS = 150       # must be straight this long before it speeds up
+STRAIGHT_ERROR = 0.6    # leave straight mode at once when the error is above this part of the range
+TURN_MEMORY = 0.9       # smoothing of the turning measurement
+BOOST_RAMP = 1          # extra power added per loop (10 ms) until STRAIGHT_BOOST is reached
+
 # --- Obstacle ---
 LASER_PORT = Port.S2  # port of the laser distance sensor (change if it is plugged in elsewhere)
 SLOW_MM = 600       # obstacle closer than this: slow down
@@ -149,6 +163,7 @@ def run():
         return
     setpoint = (white + black) / 2
     lost_error = 0.8 * (white - setpoint)
+    half = white - setpoint
     log("white={:.0f} black={:.0f} setpoint={:.0f}".format(white, black, setpoint))
 
     # Pivot slowly until the sensor is exactly on the edge
@@ -228,6 +243,11 @@ def run():
     d = 0
     integral = 0
     last_sign = 1
+    last_l, last_r = lpos(), rpos()
+    turn_avg = 0         # smoothed turning (left - right wheel degrees per loop)
+    drive_avg = 0        # smoothed driving (average wheel degrees per loop)
+    straight_since = None
+    boost = 0            # current extra power on a straight
     close = 0                        # valid readings in a row closer than SWERVE_MM
     near = SLOW_MM + 1               # last valid distance (used while a reading is invalid)
     last_log = 0
@@ -257,11 +277,29 @@ def run():
             near = SLOW_MM + 1
             e_prev = d = integral = 0
             last_sign = -1               # it came in from the left: if it overshoots, the line is left
+            last_l, last_r = lpos(), rpos()
+            turn_avg = drive_avg = boost = 0
+            straight_since = None
             last_tick = ticks_ms()
             continue
 
         # Line following (same as line_follow_safe.py)
         e = light.reflection() - setpoint         # > 0: too much white -> turn right
+
+        # Straight-line detection: how much is the robot turning compared to how far it drives?
+        l_pos, r_pos = lpos(), rpos()
+        dl, dr = l_pos - last_l, r_pos - last_r
+        last_l, last_r = l_pos, r_pos
+        turn_avg = TURN_MEMORY * turn_avg + (1 - TURN_MEMORY) * (dl - dr)
+        drive_avg = TURN_MEMORY * drive_avg + (1 - TURN_MEMORY) * (dl + dr) / 2
+        if (drive_avg > 0 and abs(turn_avg) < STRAIGHT_RATIO * drive_avg
+                and abs(e) < STRAIGHT_ERROR * half and near >= SLOW_MM):
+            if straight_since is None:
+                straight_since = now
+        else:
+            straight_since = None
+        on_straight = straight_since is not None and ticks_diff(now, straight_since) >= STRAIGHT_MS
+        boost = min(STRAIGHT_BOOST, boost + BOOST_RAMP) if on_straight else 0
         d = D_FILTER * d + (1 - D_FILTER) * (e - e_prev) * 10 / dt
         e_prev = e
         if (e > 0) != (integral > 0):
@@ -270,12 +308,13 @@ def run():
         if e > lost_error:
             u = last_sign * LOST_TURN
         else:
-            u = KP * e + KI * integral + KD * d
+            kp = KP * STRAIGHT_KP if on_straight else KP
+            u = kp * e + KI * integral + KD * d
             if abs(u) > 2:
                 last_sign = 1 if u > 0 else -1
 
         # Slow down when the obstacle gets close
-        base = BASE_POWER
+        base = BASE_POWER + boost
         if near < SLOW_MM:
             base *= clamp((near - SWERVE_MM) / (SLOW_MM - SWERVE_MM), SLOW_MIN, 1)
 
