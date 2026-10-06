@@ -1,20 +1,23 @@
 # Line follower that drives around an obstacle (a bottle, 6 cm diameter) on the line
 # Line following is the same as line_follow_safe.py (BASE_POWER 88, KP 1.2, KD 7).
 #
-# Setup: Open-Cube color sensor on S1 (pointing down, CAM_AHEAD_CM in front of the wheel axis)
+# Setup: Open-Cube color sensor on S1 (pointing down)
 #        Open-Cube laser distance sensor (LIDAR) on LASER_PORT, at the front, pointing forward
 #        (read in its wide field-of-view mode, distance_fov(), so it also sees a narrow bottle
 #        that is not exactly in front of the middle of the robot)
 #        Left motor M1, right motor M2
 # Usage: put the color sensor on the EDGE of the line (half on black, half on white), run the
 #        program. It measures white and black (pivots over the line) and follows the left
-#        edge. When the bottle is ahead it slows down, stops, drives around it on the left
-#        (the white side) and continues on the line behind it. Press LEFT to stop.
+#        edge. When the bottle is ahead it slows down and swerves around it on the left (the
+#        white side) without stopping, then continues on the line behind it. LEFT = stop.
 #
-# Going around (all distances measured with the wheel encoders):
-#   turn 90 left -> drive SIDE_CM -> turn 90 right -> drive PASS_CM (past the bottle)
-#   -> turn 90 right -> drive until the color sensor sees the line (max RETURN_CM)
-#   -> drive CAM_AHEAD_CM more (wheels over the edge) -> turn 90 left -> follow the line
+# Going around = a smooth swerve, steered with the wheel encoders (heading and position):
+#   1. out:   curve to SWERVE_DEG left until the middle of the robot is about SIDE_CM beside
+#             the line (never more than MAX_SIDE_CM)
+#   2. past:  straight, parallel to the line, until the back of the robot is past the bottle
+#   3. in:    curve to SWERVE_DEG right, toward the line, until the color sensor sees it
+#   4. the normal line following takes over and straightens the robot out on the line
+import math
 from time import sleep_ms, ticks_ms, ticks_diff
 from lib.robot_consts import Sensor, Port, Button
 
@@ -35,24 +38,27 @@ MIN_CONTRAST = 20   # white minus black must be at least this, else the sensor i
 
 # --- Obstacle ---
 LASER_PORT = Port.S2  # port of the laser distance sensor (change if it is plugged in elsewhere)
-SLOW_MM = 400       # obstacle closer than this: slow down
-STOP_MM = 200       # obstacle closer than this: stop and drive around it (room to turn in place)
-SLOW_MIN = 0.3      # slowest speed while approaching, as a fraction of BASE_POWER
-CONFIRM = 3         # this many readings in a row below STOP_MM before it reacts (no false alarms)
+SLOW_MM = 600       # obstacle closer than this: slow down
+SWERVE_MM = 300     # obstacle closer than this: swerve around it
+SLOW_MIN = 0.5      # slowest speed while approaching, as a fraction of BASE_POWER
+CONFIRM = 3         # this many valid readings in a row below SWERVE_MM before it reacts
 MIN_VALID_MM = 20   # readings below this are invalid (no target / too close to measure)
 
-# --- Going around (robot measurements and distances, in cm) ---
+# --- Going around (robot measurements in cm) ---
 WHEEL_CM = 8.0      # wheel diameter
 TRACK_CM = 19.0     # distance between the wheels
-CAM_AHEAD_CM = 4.0  # color sensor in front of the wheel axis
-SIDE_CM = 25        # sideways away from the line (half robot width + bottle + margin)
-PASS_CM = 60        # forward past the bottle (far enough that the robot does not hit it when turning back)
-RETURN_CM = 60      # max distance back toward the line before it gives up
-AVOID_POWER = 40    # motor power while going around
-TURN_POWER = 30     # motor power while turning in place
+LIDAR_AHEAD_CM = 10 # laser sensor in front of the wheel axis
+REAR_CM = 12        # robot length behind the wheel axis
+BOTTLE_R_CM = 3     # bottle radius
+SIDE_CM = 19        # middle of the robot this far beside the line while passing the bottle
+MAX_SIDE_CM = 20    # never further than this from the line
+SWERVE_DEG = 35     # angle away from / back toward the line
+AVOID_POWER = 45    # forward power while swerving
+HEADING_GAIN = 1.5  # steering power per degree of heading error while swerving
+RETURN_CM = 80      # max forward distance looking for the line before it gives up
 
-DEG_PER_CM = 360 / (3.1416 * WHEEL_CM)          # wheel degrees per cm driven
-DEG_PER_TURN_DEG = 2 * TRACK_CM / WHEEL_CM      # left-right wheel degrees per degree of robot turn
+DEG_PER_CM = 360 / (math.pi * WHEEL_CM)          # wheel degrees per cm driven
+DEG_PER_TURN_DEG = 2 * TRACK_CM / WHEEL_CM       # left-right wheel degrees per degree of robot turn
 
 
 def log(message):
@@ -86,54 +92,6 @@ def run():
     def stopped_by_user():
         return robot.buttons.pressed()[Button.LEFT]
 
-    # --- Moves for going around (encoders) ---
-    def turn(angle):
-        # Turn in place by angle degrees (> 0 right, < 0 left); slower near the end. False on LEFT.
-        begin = heading()
-        goal = begin + angle * DEG_PER_TURN_DEG
-        direction = 1 if angle > 0 else -1
-        start = ticks_ms()
-        while (goal - heading()) * direction > 0 and ticks_diff(ticks_ms(), start) < 4000:
-            if stopped_by_user():
-                return False
-            rest = abs(goal - heading())
-            power = TURN_POWER if rest > 60 else max(15, TURN_POWER * rest / 60)
-            left.set_power(direction * power)
-            right.set_power(-direction * power)
-            sleep_ms(5)
-        stop()
-        log("  turn {} deg: turned {:.0f} deg in {} ms".format(
-            angle, (heading() - begin) / DEG_PER_TURN_DEG, ticks_diff(ticks_ms(), start)))
-        sleep_ms(150)
-        return True
-
-    def drive(cm, until=None):
-        # Drive straight forward cm (keeping the heading); stops early when until() is True.
-        # Returns "done", "found" (until() became True) or "user" (LEFT).
-        start_pos = (left.position() + right.position()) / 2
-        start_heading = heading()
-        goal = cm * DEG_PER_CM
-        start = ticks_ms()
-        while (left.position() + right.position()) / 2 - start_pos < goal \
-                and ticks_diff(ticks_ms(), start) < 8000:
-            if stopped_by_user():
-                stop()
-                return "user"
-            if until is not None and until():
-                stop()
-                moved = ((left.position() + right.position()) / 2 - start_pos) / DEG_PER_CM
-                log("  drive up to {} cm: line found after {:.0f} cm".format(cm, moved))
-                return "found"
-            correction = (heading() - start_heading) * 0.5   # keep driving straight
-            left.set_power(AVOID_POWER - correction)
-            right.set_power(AVOID_POWER + correction)
-            sleep_ms(5)
-        stop()
-        moved = ((left.position() + right.position()) / 2 - start_pos) / DEG_PER_CM
-        log("  drive {} cm: drove {:.0f} cm in {} ms".format(cm, moved, ticks_diff(ticks_ms(), start)))
-        sleep_ms(150)
-        return "done"
-
     # --- Measure white and black (same as line_follow_safe.py) ---
     seen = [100, 0]
 
@@ -162,42 +120,76 @@ def run():
     lost_error = 0.8 * (white - setpoint)
     log("white={:.0f} black={:.0f} setpoint={:.0f}".format(white, black, setpoint))
 
-    def align():
-        # Pivot slowly until the sensor is exactly on the edge
-        side = 1 if light.reflection() > setpoint else -1
-        start = ticks_ms()
-        while (light.reflection() - setpoint) * side > 0 and ticks_diff(ticks_ms(), start) < 3000:
-            left.set_power(side * CAL_POWER)
-            right.set_power(-side * CAL_POWER)
-            sleep_ms(5)
-        stop()
+    # Pivot slowly until the sensor is exactly on the edge
+    side = 1 if light.reflection() > setpoint else -1
+    start = ticks_ms()
+    while (light.reflection() - setpoint) * side > 0 and ticks_diff(ticks_ms(), start) < 3000:
+        left.set_power(side * CAL_POWER)
+        right.set_power(-side * CAL_POWER)
+        sleep_ms(5)
+    stop()
 
-    align()
+    def go_around(dist_mm):
+        # Swerve around the obstacle on the left without stopping. The position is tracked
+        # with the encoders: x = along the line, y = to the left of it (cm), from here.
+        # Returns True when the color sensor is back on the line, False if not (or LEFT).
+        bottle_x = dist_mm / 10 + LIDAR_AHEAD_CM + BOTTLE_R_CM    # bottle centre ahead of the axis
+        log("Obstacle {} mm ahead, swerving around it".format(dist_mm))
+        h0 = heading()
+        pos = {"x": 0.0, "y": 0.0, "l": left.position(), "r": right.position(), "max_y": 0.0}
 
-    def go_around():
-        # Drive around the obstacle on the left and come back onto the left edge of the line.
-        # Returns True when back on the line, False if not (or LEFT pressed).
-        log("Obstacle! Going around")
-        stop()
-        sleep_ms(200)
-        if not turn(-90):
+        def angle():
+            # Robot heading relative to the line, degrees (> 0 = turned right)
+            return (heading() - h0) / DEG_PER_TURN_DEG
+
+        def update():
+            l, r = left.position(), right.position()
+            ds = ((l - pos["l"]) + (r - pos["r"])) / 2 / DEG_PER_CM
+            pos["l"], pos["r"] = l, r
+            a = angle() * math.pi / 180
+            pos["x"] += ds * math.cos(a)
+            pos["y"] -= ds * math.sin(a)
+            pos["max_y"] = max(pos["max_y"], pos["y"])
+
+        def steer(target, done):
+            # Drive forward while turning toward heading `target` until done() is True.
+            # Returns "done", "user" (LEFT) or "time".
+            start = ticks_ms()
+            while ticks_diff(ticks_ms(), start) < 8000:
+                if stopped_by_user():
+                    return "user"
+                update()
+                if done():
+                    return "done"
+                u = clamp(HEADING_GAIN * (target - angle()), -AVOID_POWER, AVOID_POWER)
+                left.set_power(AVOID_POWER + u)       # u > 0: left faster = turn right
+                right.set_power(AVOID_POWER - u)
+                sleep_ms(5)
+            return "time"
+
+        # 1. Out: curve left until far enough beside the line (the turn back adds a little)
+        if steer(-SWERVE_DEG, lambda: pos["y"] >= SIDE_CM - 4 or pos["y"] >= MAX_SIDE_CM - 2) != "done":
             return False
-        if drive(SIDE_CM) == "user":
+        log("  out: {:.0f} cm beside the line after {:.0f} cm".format(pos["y"], pos["x"]))
+        # 2. Past: parallel to the line until the back of the robot is past the bottle
+        if steer(0, lambda: pos["x"] >= bottle_x + BOTTLE_R_CM + REAR_CM + 2) != "done":
             return False
-        if not turn(90):
+        log("  past the bottle: x={:.0f} cm, max {:.0f} cm beside the line".format(pos["x"], pos["max_y"]))
+        # 3. In: curve toward the line until the color sensor sees it
+        x_in = pos["x"]
+        found = []
+
+        def line_or_give_up():
+            if light.reflection() < setpoint:
+                found.append(True)
+                return True
+            return pos["x"] - x_in > RETURN_CM
+
+        if steer(SWERVE_DEG, line_or_give_up) != "done" or not found:
+            stop()
+            log("Line not found after the obstacle")
             return False
-        if drive(PASS_CM) == "user":
-            return False
-        if not turn(90):
-            return False
-        found = drive(RETURN_CM, until=lambda: light.reflection() < setpoint)
-        if found != "found":
-            log("Line not found after the obstacle ({})".format(found))
-            return False
-        drive(CAM_AHEAD_CM)          # wheels over the edge, then turn back along the line
-        if not turn(-90):
-            return False
-        log("Back on the line")
+        log("  back on the line after {:.0f} cm (max {:.0f} cm beside the line)".format(pos["x"], pos["max_y"]))
         return True
 
     # --- Follow the line, watch for the obstacle ---
@@ -205,7 +197,7 @@ def run():
     d = 0
     integral = 0
     last_sign = 1
-    close = 0                        # valid readings in a row closer than STOP_MM
+    close = 0                        # valid readings in a row closer than SWERVE_MM
     near = SLOW_MM + 1               # last valid distance (used while a reading is invalid)
     last_log = 0
     last_tick = ticks_ms()
@@ -223,16 +215,17 @@ def run():
         dist = laser.distance_fov()      # wide field of view: also sees a bottle a bit off-centre
         if dist >= MIN_VALID_MM:
             near = dist
-            close = close + 1 if dist < STOP_MM else 0
+            close = close + 1 if dist < SWERVE_MM else 0
         if near < SLOW_MM and ticks_diff(now, last_log) >= 100:
             log("  laser {} mm (valid {} mm), close {}/{}".format(dist, near, close, CONFIRM))
             last_log = now
         if close >= CONFIRM:
-            if not go_around():
+            if not go_around(near):
                 break
             close = 0
             near = SLOW_MM + 1
             e_prev = d = integral = 0
+            last_sign = -1               # it came in from the left: if it overshoots, the line is left
             last_tick = ticks_ms()
             continue
 
@@ -253,7 +246,7 @@ def run():
         # Slow down when the obstacle gets close
         base = BASE_POWER
         if near < SLOW_MM:
-            base *= clamp((near - STOP_MM) / (SLOW_MM - STOP_MM), SLOW_MIN, 1)
+            base *= clamp((near - SWERVE_MM) / (SLOW_MM - SWERVE_MM), SLOW_MIN, 1)
 
         speed = max(0, base - SLOWDOWN * abs(e))
         left.set_power(clamp(speed + u, MIN_POWER, 100))
