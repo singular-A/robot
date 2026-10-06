@@ -86,8 +86,38 @@ def run():
         left.set_power(0)
         right.set_power(0)
 
+    # Encoder directions: checked at the start (some motors count backwards)
+    sign = {"l": 1, "r": 1}
+
+    def lpos():
+        return sign["l"] * left.position()
+
+    def rpos():
+        return sign["r"] * right.position()
+
     def heading():
-        return left.position() - right.position()
+        return lpos() - rpos()
+
+    def check_encoders():
+        # Short wiggle: left wheel forward, right wheel backward, then back again.
+        # Forward must count up; if a wheel counts down, flip its sign.
+        l0, r0 = left.position(), right.position()
+        left.set_power(CAL_POWER)
+        right.set_power(-CAL_POWER)
+        sleep_ms(250)
+        stop()
+        sleep_ms(100)
+        dl, dr = left.position() - l0, right.position() - r0
+        left.set_power(-CAL_POWER)
+        right.set_power(CAL_POWER)
+        sleep_ms(250)
+        stop()
+        sleep_ms(100)
+        sign["l"] = 1 if dl >= 0 else -1
+        sign["r"] = 1 if dr <= 0 else -1
+        log("encoders: left {} deg, right {} deg -> signs left {:+d} right {:+d}{}".format(
+            dl, dr, sign["l"], sign["r"],
+            "  WARNING: an encoder is not counting" if abs(dl) < 10 or abs(dr) < 10 else ""))
 
     def stopped_by_user():
         return robot.buttons.pressed()[Button.LEFT]
@@ -108,6 +138,7 @@ def run():
         stop()
 
     sleep_ms(1000)
+    check_encoders()
     home = heading()
     pivot_to(home + CAL_SWEEP)
     pivot_to(home - CAL_SWEEP)
@@ -136,14 +167,14 @@ def run():
         bottle_x = dist_mm / 10 + LIDAR_AHEAD_CM + BOTTLE_R_CM    # bottle centre ahead of the axis
         log("Obstacle {} mm ahead, swerving around it".format(dist_mm))
         h0 = heading()
-        pos = {"x": 0.0, "y": 0.0, "l": left.position(), "r": right.position(), "max_y": 0.0}
+        pos = {"x": 0.0, "y": 0.0, "l": lpos(), "r": rpos(), "max_y": 0.0}
 
         def angle():
             # Robot heading relative to the line, degrees (> 0 = turned right)
             return (heading() - h0) / DEG_PER_TURN_DEG
 
         def update():
-            l, r = left.position(), right.position()
+            l, r = lpos(), rpos()
             ds = ((l - pos["l"]) + (r - pos["r"])) / 2 / DEG_PER_CM
             pos["l"], pos["r"] = l, r
             a = angle() * math.pi / 180
