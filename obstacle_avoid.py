@@ -89,7 +89,8 @@ def run():
     # --- Moves for going around (encoders) ---
     def turn(angle):
         # Turn in place by angle degrees (> 0 right, < 0 left); slower near the end. False on LEFT.
-        goal = heading() + angle * DEG_PER_TURN_DEG
+        begin = heading()
+        goal = begin + angle * DEG_PER_TURN_DEG
         direction = 1 if angle > 0 else -1
         start = ticks_ms()
         while (goal - heading()) * direction > 0 and ticks_diff(ticks_ms(), start) < 4000:
@@ -101,6 +102,8 @@ def run():
             right.set_power(-direction * power)
             sleep_ms(5)
         stop()
+        log("  turn {} deg: turned {:.0f} deg in {} ms".format(
+            angle, (heading() - begin) / DEG_PER_TURN_DEG, ticks_diff(ticks_ms(), start)))
         sleep_ms(150)
         return True
 
@@ -118,12 +121,16 @@ def run():
                 return "user"
             if until is not None and until():
                 stop()
+                moved = ((left.position() + right.position()) / 2 - start_pos) / DEG_PER_CM
+                log("  drive up to {} cm: line found after {:.0f} cm".format(cm, moved))
                 return "found"
             correction = (heading() - start_heading) * 0.5   # keep driving straight
             left.set_power(AVOID_POWER - correction)
             right.set_power(AVOID_POWER + correction)
             sleep_ms(5)
         stop()
+        moved = ((left.position() + right.position()) / 2 - start_pos) / DEG_PER_CM
+        log("  drive {} cm: drove {:.0f} cm in {} ms".format(cm, moved, ticks_diff(ticks_ms(), start)))
         sleep_ms(150)
         return "done"
 
@@ -198,21 +205,33 @@ def run():
     d = 0
     integral = 0
     last_sign = 1
-    close = 0                        # readings in a row closer than STOP_MM
+    close = 0                        # valid readings in a row closer than STOP_MM
+    near = SLOW_MM + 1               # last valid distance (used while a reading is invalid)
+    last_log = 0
     last_tick = ticks_ms()
     while not stopped_by_user():
         now = ticks_ms()
         dt = max(ticks_diff(now, last_tick), 1)
         last_tick = now
+        if dt > 50:
+            # A loop normally takes ~10 ms; a long one means a sensor read was blocked
+            # (the firmware waits up to 3 s if a sensor drops out) and the robot drove blind
+            log("  SLOW LOOP {} ms - a sensor was not responding".format(dt))
 
-        # Obstacle ahead?
+        # Obstacle ahead? Invalid readings (no target / too close to measure) are skipped:
+        # they neither count nor reset the count, and the last valid distance is kept.
         dist = laser.distance_fov()      # wide field of view: also sees a bottle a bit off-centre
-        valid = dist >= MIN_VALID_MM
-        close = close + 1 if valid and dist < STOP_MM else 0
+        if dist >= MIN_VALID_MM:
+            near = dist
+            close = close + 1 if dist < STOP_MM else 0
+        if near < SLOW_MM and ticks_diff(now, last_log) >= 100:
+            log("  laser {} mm (valid {} mm), close {}/{}".format(dist, near, close, CONFIRM))
+            last_log = now
         if close >= CONFIRM:
             if not go_around():
                 break
             close = 0
+            near = SLOW_MM + 1
             e_prev = d = integral = 0
             last_tick = ticks_ms()
             continue
@@ -233,8 +252,8 @@ def run():
 
         # Slow down when the obstacle gets close
         base = BASE_POWER
-        if valid and dist < SLOW_MM:
-            base *= clamp((dist - STOP_MM) / (SLOW_MM - STOP_MM), SLOW_MIN, 1)
+        if near < SLOW_MM:
+            base *= clamp((near - STOP_MM) / (SLOW_MM - STOP_MM), SLOW_MIN, 1)
 
         speed = max(0, base - SLOWDOWN * abs(e))
         left.set_power(clamp(speed + u, MIN_POWER, 100))
