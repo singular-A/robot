@@ -3,9 +3,9 @@
 # Setup: color sensor on S1 (pointing down), laser distance sensor on S2 (pointing forward)
 # Usage: put the color sensor on the edge of the line and run. It measures white and black,
 #        then follows the line. The first time the laser sees something closer than
-#        AVOID_MM it drives around it with a fixed, timed move:
-#          1. turn right    2. drive straight past it    3. curve left until it sees the line
-#        then it follows the line again. Only one obstacle: the laser is not read after that.
+#        AVOID_MM it drives around it with a fixed, timed move (AROUND):
+#          turn right, out, turn left (parallel), past the bottle, turn left (toward the line)
+#        then drives straight until the sensor sees the line, and follows the line again. Only one obstacle: the laser is not read after that.
 #        LEFT button = stop.
 from time import sleep_ms, ticks_ms, ticks_diff
 from lib.robot_consts import Sensor, Port, Button
@@ -31,11 +31,17 @@ CAL_POWER = 25      # pivot power while measuring white and black
 AVOID_MM = 250      # obstacle closer than this: drive around it
 CONFIRM = 3         # this many readings in a row before it reacts (ignores single glitches)
 
-# The move around the obstacle: (left power, right power, time in ms). Tune these.
-TURN_RIGHT = (60, 10, 500)
-PASS = (50, 50, 1200)
-CURVE_LEFT = (25, 50)        # curve until the line is seen
-CURVE_MAX_MS = 4000          # give up and stop if no line is found by then
+# The move around the obstacle, step by step: (left power, right power, time in ms).
+# Tune the times on the track: longer turn = bigger angle, longer straight = further.
+AROUND = [
+    (50, -50, 300),     # pivot right, about 45 degrees
+    (50, 50, 700),      # drive out, away from the line
+    (-50, 50, 300),     # pivot left, back parallel to the line
+    (50, 50, 1200),     # drive past the bottle
+    (-50, 50, 300),     # pivot left, about 45 degrees toward the line
+]
+RETURN = (40, 40)       # then straight toward the line until the sensor sees it
+RETURN_MAX_MS = 3000    # give up and stop if no line is found by then
 
 
 def log(message):
@@ -104,13 +110,13 @@ def run():
             close = close + 1 if 20 <= dist < AVOID_MM else 0
             if close >= CONFIRM:
                 log("Obstacle at {} mm".format(dist))
-                drive(*TURN_RIGHT)
-                drive(*PASS)
-                left.set_power(CURVE_LEFT[0])
-                right.set_power(CURVE_LEFT[1])
+                for step in AROUND:
+                    drive(*step)
+                left.set_power(RETURN[0])
+                right.set_power(RETURN[1])
                 start = ticks_ms()
                 while light.reflection() > setpoint:
-                    if stop_pressed() or ticks_diff(ticks_ms(), start) > CURVE_MAX_MS:
+                    if stop_pressed() or ticks_diff(ticks_ms(), start) > RETURN_MAX_MS:
                         drive(0, 0, 0)
                         log("Line not found after the obstacle")
                         return
