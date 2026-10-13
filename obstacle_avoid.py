@@ -8,14 +8,16 @@
 #        Left motor M1, right motor M2
 # Usage: put the color sensor on the EDGE of the line (half on black, half on white), run the
 #        program. It measures white and black (pivots over the line) and follows the left
-#        edge. When the bottle is ahead it slows down and swerves around it on the left (the
-#        white side) without stopping, then continues on the line behind it. LEFT = stop.
+#        edge. The bottle is detected ONCE: it slows down and swerves around it, hardcoded off
+#        to the RIGHT, without stopping, then steers back LEFT once it is past the bottle and
+#        continues on the line behind it. After that the laser is not checked any more.
+#        LEFT = stop.
 #
 # Going around = a smooth swerve, steered with the wheel encoders (heading and position):
-#   1. out:   curve to SWERVE_DEG left until the middle of the robot is about SIDE_CM beside
+#   1. out:   curve to SWERVE_DEG right until the middle of the robot is about SIDE_CM beside
 #             the line (never more than MAX_SIDE_CM)
 #   2. past:  straight, parallel to the line, until the back of the robot is past the bottle
-#   3. in:    curve to SWERVE_DEG right, toward the line, until the color sensor sees it
+#   3. in:    curve to SWERVE_DEG left, toward the line, until the color sensor sees it
 #   4. the normal line following takes over and straightens the robot out on the line
 import math
 from time import sleep_ms, ticks_ms, ticks_diff
@@ -40,10 +42,13 @@ MIN_CONTRAST = 20   # white minus black must be at least this, else the sensor i
 # straight = for STRAIGHT_MS the robot hardly turns (wheel encoders: turning per distance
 # below STRAIGHT_RATIO) and stays close to the edge. Then: STRAIGHT_BOOST extra power
 # (added gradually) and a softer KP (KP * STRAIGHT_KP) against the wobble. As soon as it
-# turns or drifts off the edge (a curve begins), back to normal at once. Off near obstacles.
+# turns or drifts off the edge (a curve begins), it eases back to normal (KP_RAMP, BOOST_DECAY)
+# instead of jumping, so the steering does not change suddenly. Off near obstacles.
 # STRAIGHT_BOOST = 0 and STRAIGHT_KP = 1 turn it off.
-STRAIGHT_BOOST = 25     # extra forward power on straights
-STRAIGHT_KP = 0.6       # KP is multiplied by this on straights
+STRAIGHT_BOOST = 15     # extra forward power on straights (test value, was 25)
+STRAIGHT_KP = 0.7       # KP is multiplied by this on straights (test value, was 0.6)
+KP_RAMP = 0.03          # change of the KP factor per loop, both into and out of straight mode
+BOOST_DECAY = 3         # extra power removed per loop when leaving a straight
 STRAIGHT_RATIO = 0.25   # straight = turning less than this per distance driven
 STRAIGHT_MS = 150       # must be straight this long before it speeds up
 STRAIGHT_ERROR = 0.6    # leave straight mode at once when the error is above this part of the range
@@ -66,7 +71,7 @@ REAR_CM = 12        # robot length behind the wheel axis
 BOTTLE_R_CM = 3     # bottle radius
 SIDE_CM = 19        # middle of the robot this far beside the line while passing the bottle
 MAX_SIDE_CM = 20    # never further than this from the line
-SWERVE_DEG = 35     # angle away from / back toward the line
+SWERVE_DEG = 35     # angle away from (right) / back toward (left) the line
 AVOID_POWER = 45    # forward power while swerving
 HEADING_GAIN = 1.5  # steering power per degree of heading error while swerving
 RETURN_CM = 80      # max forward distance looking for the line before it gives up
@@ -176,8 +181,8 @@ def run():
     stop()
 
     def go_around(dist_mm):
-        # Swerve around the obstacle on the left without stopping. The position is tracked
-        # with the encoders: x = along the line, y = to the left of it (cm), from here.
+        # Swerve around the obstacle on the right without stopping. The position is tracked
+        # with the encoders: x = along the line, y = to the right of it (cm), from here.
         # Returns True when the color sensor is back on the line, False if not (or LEFT).
         bottle_x = dist_mm / 10 + LIDAR_AHEAD_CM + BOTTLE_R_CM    # bottle centre ahead of the axis
         log("Obstacle {} mm ahead, swerving around it".format(dist_mm))
@@ -194,7 +199,7 @@ def run():
             pos["l"], pos["r"] = l, r
             a = angle() * math.pi / 180
             pos["x"] += ds * math.cos(a)
-            pos["y"] -= ds * math.sin(a)
+            pos["y"] += ds * math.sin(a)
             pos["max_y"] = max(pos["max_y"], pos["y"])
 
         def steer(target, done):
@@ -213,15 +218,15 @@ def run():
                 sleep_ms(5)
             return "time"
 
-        # 1. Out: curve left until far enough beside the line (the turn back adds a little)
-        if steer(-SWERVE_DEG, lambda: pos["y"] >= SIDE_CM - 4 or pos["y"] >= MAX_SIDE_CM - 2) != "done":
+        # 1. Out: curve right until far enough beside the line (the turn back adds a little)
+        if steer(SWERVE_DEG, lambda: pos["y"] >= SIDE_CM - 4 or pos["y"] >= MAX_SIDE_CM - 2) != "done":
             return False
         log("  out: {:.0f} cm beside the line after {:.0f} cm".format(pos["y"], pos["x"]))
         # 2. Past: parallel to the line until the back of the robot is past the bottle
         if steer(0, lambda: pos["x"] >= bottle_x + BOTTLE_R_CM + REAR_CM + 2) != "done":
             return False
         log("  past the bottle: x={:.0f} cm, max {:.0f} cm beside the line".format(pos["x"], pos["max_y"]))
-        # 3. In: curve toward the line until the color sensor sees it
+        # 3. In: curve left, toward the line, until the color sensor sees it
         x_in = pos["x"]
         found = []
 
@@ -231,7 +236,7 @@ def run():
                 return True
             return pos["x"] - x_in > RETURN_CM
 
-        if steer(SWERVE_DEG, line_or_give_up) != "done" or not found:
+        if steer(-SWERVE_DEG, line_or_give_up) != "done" or not found:
             stop()
             log("Line not found after the obstacle")
             return False
@@ -248,7 +253,9 @@ def run():
     drive_avg = 0        # smoothed driving (average wheel degrees per loop)
     straight_since = None
     boost = 0            # current extra power on a straight
+    kp_scale = 1.0       # current KP factor: STRAIGHT_KP on a straight, 1 otherwise
     close = 0                        # valid readings in a row closer than SWERVE_MM
+    avoided = False                  # True after the one obstacle has been driven around
     near = SLOW_MM + 1               # last valid distance (used while a reading is invalid)
     last_log = 0
     last_tick = ticks_ms()
@@ -263,22 +270,25 @@ def run():
 
         # Obstacle ahead? Invalid readings (no target / too close to measure) are skipped:
         # they neither count nor reset the count, and the last valid distance is kept.
-        dist = laser.distance_fov()      # wide field of view: also sees a bottle a bit off-centre
-        if dist >= MIN_VALID_MM:
-            near = dist
-            close = close + 1 if dist < SWERVE_MM else 0
-        if near < SLOW_MM and ticks_diff(now, last_log) >= 100:
-            log("  laser {} mm (valid {} mm), close {}/{}".format(dist, near, close, CONFIRM))
-            last_log = now
+        if not avoided:
+            dist = laser.distance_fov()  # wide field of view: also sees a bottle a bit off-centre
+            if dist >= MIN_VALID_MM:
+                near = dist
+                close = close + 1 if dist < SWERVE_MM else 0
+            if near < SLOW_MM and ticks_diff(now, last_log) >= 100:
+                log("  laser {} mm (valid {} mm), close {}/{}".format(dist, near, close, CONFIRM))
+                last_log = now
         if close >= CONFIRM:
             if not go_around(near):
                 break
+            avoided = True               # only one obstacle: never look for another
             close = 0
             near = SLOW_MM + 1
             e_prev = d = integral = 0
-            last_sign = -1               # it came in from the left: if it overshoots, the line is left
+            last_sign = 1                # it came in from the right: if it overshoots, the line is right
             last_l, last_r = lpos(), rpos()
             turn_avg = drive_avg = boost = 0
+            kp_scale = 1.0
             straight_since = None
             last_tick = ticks_ms()
             continue
@@ -299,7 +309,12 @@ def run():
         else:
             straight_since = None
         on_straight = straight_since is not None and ticks_diff(now, straight_since) >= STRAIGHT_MS
-        boost = min(STRAIGHT_BOOST, boost + BOOST_RAMP) if on_straight else 0
+        if on_straight:
+            boost = min(STRAIGHT_BOOST, boost + BOOST_RAMP)
+            kp_scale = max(STRAIGHT_KP, kp_scale - KP_RAMP)
+        else:
+            boost = max(0, boost - BOOST_DECAY)
+            kp_scale = min(1.0, kp_scale + KP_RAMP)
         d = D_FILTER * d + (1 - D_FILTER) * (e - e_prev) * 10 / dt
         e_prev = e
         if (e > 0) != (integral > 0):
@@ -308,8 +323,7 @@ def run():
         if e > lost_error:
             u = last_sign * LOST_TURN
         else:
-            kp = KP * STRAIGHT_KP if on_straight else KP
-            u = kp * e + KI * integral + KD * d
+            u = KP * kp_scale * e + KI * integral + KD * d
             if abs(u) > 2:
                 last_sign = 1 if u > 0 else -1
 
