@@ -45,6 +45,7 @@ AROUND = [
 RETURN = (40, 40)       # then straight toward the line until the sensor sees it
 STRAIGHT_K = 0.5        # power correction per wheel degree that one wheel is ahead
 STRAIGHT_MAX = 15       # max power correction
+STEP_PAUSE_MS = 250     # stop this long before every step, so each one starts from standstill
 RETURN_MAX_MS = 3000    # give up and stop if no line is found by then
 
 
@@ -142,7 +143,9 @@ def run():
             if close >= CONFIRM:
                 log("Obstacle at {} mm".format(dist))
                 for step in AROUND:
+                    drive(0, 0, STEP_PAUSE_MS)
                     drive(*step)
+                drive(0, 0, STEP_PAUSE_MS)
                 l0, r0 = left.position(), right.position()
                 start = ticks_ms()
                 while light.reflection() > setpoint:
