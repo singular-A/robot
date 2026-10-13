@@ -28,8 +28,9 @@ PERIOD_MS = 10      # regulation period
 CAL_POWER = 25      # pivot power while measuring white and black
 
 # Obstacle
-AVOID_MM = 250      # obstacle closer than this: drive around it
-CONFIRM = 3         # this many readings in a row before it reacts (ignores single glitches)
+AVOID_MM = 300      # obstacle closer than this: drive around it
+CONFIRM = 3         # this many valid readings in a row before it reacts (ignores single glitches)
+MIN_VALID_MM = 20   # readings below this are invalid (no target / too close): skipped, not counted
 
 # The move around the obstacle, step by step: (left power, right power, time in ms).
 # Tune the times on the track: longer turn = bigger angle, longer straight = further.
@@ -100,14 +101,19 @@ def run():
     d = 0
     integral = 0
     last_sign = 1        # last steering direction: +1 right, -1 left
-    close = 0            # readings in a row closer than AVOID_MM
+    close = 0            # valid readings in a row closer than AVOID_MM
+    last_log = 0
     avoided = False
     last_tick = ticks_ms()
     while not stop_pressed():
         # Obstacle? (only until it has driven around one)
         if not avoided:
             dist = laser.distance_fov()
-            close = close + 1 if 20 <= dist < AVOID_MM else 0
+            if dist >= MIN_VALID_MM:                 # invalid readings neither count nor reset
+                close = close + 1 if dist < AVOID_MM else 0
+            if dist < 2 * AVOID_MM and ticks_diff(ticks_ms(), last_log) >= 100:
+                log("  laser {} mm, close {}/{}".format(dist, close, CONFIRM))
+                last_log = ticks_ms()
             if close >= CONFIRM:
                 log("Obstacle at {} mm".format(dist))
                 for step in AROUND:
