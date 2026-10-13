@@ -36,9 +36,9 @@ MIN_VALID_MM = 20   # readings below this are invalid (no target / too close): s
 # Tune the times on the track: longer turn = bigger angle, longer straight = further.
 AROUND = [
     (50, -50, 300),     # pivot right, about 45 degrees
-    (50, 50, 700),      # drive out, away from the line
+    (50, 50, 1000),     # drive out, away from the line
     (-50, 50, 300),     # pivot left, back parallel to the line
-    (50, 50, 1200),     # drive past the bottle
+    (50, 50, 2400),     # drive past the bottle
     (-50, 50, 300),     # pivot left, about 45 degrees toward the line
 ]
 RETURN = (40, 40)       # then straight toward the line until the sensor sees it
