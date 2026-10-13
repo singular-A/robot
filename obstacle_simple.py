@@ -22,9 +22,11 @@ KD = 7.0            # damping
 D_FILTER = 0.7      # derivative smoothing 0..1
 I_LIMIT = 50        # max steering power from the integral term
 SLOWDOWN = 1        # forward power lost per unit of error
-SPEED_MEMORY = 0.95 # smoothing of that slowdown, so the speed does not pulse with every wobble
+SPEED_MEMORY = 0.95 # slows down at once, but speeds up again only gradually (no pulsing on straights)
 MIN_POWER = -25     # lowest wheel power
 LOST_TURN = 40      # steering power when only white is seen
+LOST_POWER = 35     # max forward power when only white is seen, so it does not drift far off the
+                    # line and comes back slowly enough to catch it instead of crossing it
 PERIOD_MS = 10      # regulation period
 CAL_POWER = 25      # pivot power while measuring white and black
 
@@ -135,7 +137,7 @@ def run():
     last_log = 0
     avoided = False
     loops = 0
-    e_avg = 0            # smoothed |error|, for the slowdown
+    e_avg = 0            # |error| for the slowdown: jumps up at once, decays slowly
     last_tick = ticks_ms()
     while not stop_pressed():
         # Obstacle? (only until it has driven around one)
@@ -186,8 +188,10 @@ def run():
             if abs(u) > 2:
                 last_sign = 1 if u > 0 else -1
         slow = avoided and ticks_diff(now, back_at) < AFTER_MS
-        e_avg = SPEED_MEMORY * e_avg + (1 - SPEED_MEMORY) * abs(e)
+        e_avg = max(abs(e), SPEED_MEMORY * e_avg)
         speed = max(0, (AFTER_POWER if slow else BASE_POWER) - SLOWDOWN * e_avg)
+        if e > lost_error:
+            speed = min(speed, LOST_POWER)
         left.set_power(clamp(speed + u, MIN_POWER, 100))
         right.set_power(clamp(speed - u, MIN_POWER, 100))
         sleep_ms(PERIOD_MS)
