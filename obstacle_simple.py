@@ -41,7 +41,10 @@ AROUND = [
     (50, 50, 2400),     # drive past the bottle
     (-50, 50, 300),     # pivot left, about 45 degrees toward the line
 ]
+# Straight steps (both powers equal) are kept straight with the wheel encoders.
 RETURN = (40, 40)       # then straight toward the line until the sensor sees it
+STRAIGHT_K = 0.5        # power correction per wheel degree that one wheel is ahead
+STRAIGHT_MAX = 15       # max power correction
 RETURN_MAX_MS = 3000    # give up and stop if no line is found by then
 
 
@@ -63,11 +66,28 @@ def run():
     laser = robot.sensors.laser[Port.S2]
     left = robot.motors[LEFT_MOTOR]
     right = robot.motors[RIGHT_MOTOR]
+    left.init_encoder()
+    right.init_encoder()
+    sign = [1, 1]        # encoder directions (some motors count backwards), set at calibration
+
+    def straight(power, l0, r0):
+        # Same power on both wheels, corrected so both wheels have turned equally since l0, r0
+        ahead = sign[0] * (left.position() - l0) - sign[1] * (right.position() - r0)
+        u = clamp(STRAIGHT_K * ahead, -STRAIGHT_MAX, STRAIGHT_MAX)
+        left.set_power(power - u)
+        right.set_power(power + u)
 
     def drive(left_power, right_power, ms):
-        left.set_power(left_power)
-        right.set_power(right_power)
-        sleep_ms(ms)
+        if left_power != right_power or left_power == 0:   # turn or stop: no correction
+            left.set_power(left_power)
+            right.set_power(right_power)
+            sleep_ms(ms)
+            return
+        l0, r0 = left.position(), right.position()
+        start = ticks_ms()
+        while ticks_diff(ticks_ms(), start) < ms:
+            straight(left_power, l0, r0)
+            sleep_ms(5)
 
     def stop_pressed():
         return robot.buttons.pressed()[Button.LEFT]
@@ -75,7 +95,8 @@ def run():
     # Measure white and black: pivot right, left, back right, remember darkest and brightest
     sleep_ms(1000)
     black, white = 100, 0
-    for direction, ms in ((1, 400), (-1, 800), (1, 400)):
+    l0, r0 = left.position(), right.position()
+    for i, (direction, ms) in enumerate(((1, 400), (-1, 800), (1, 400))):
         start = ticks_ms()
         while ticks_diff(ticks_ms(), start) < ms:
             left.set_power(direction * CAL_POWER)
@@ -83,6 +104,10 @@ def run():
             r = light.reflection()
             black, white = min(black, r), max(white, r)
             sleep_ms(5)
+        if i == 0:
+            # First pivot: left wheel went forward, right wheel backward
+            sign[0] = 1 if left.position() >= l0 else -1
+            sign[1] = 1 if right.position() <= r0 else -1
     drive(0, 0, 100)
     setpoint = (white + black) / 2
     lost_error = 0.8 * (white - setpoint)
@@ -118,10 +143,10 @@ def run():
                 log("Obstacle at {} mm".format(dist))
                 for step in AROUND:
                     drive(*step)
-                left.set_power(RETURN[0])
-                right.set_power(RETURN[1])
+                l0, r0 = left.position(), right.position()
                 start = ticks_ms()
                 while light.reflection() > setpoint:
+                    straight(RETURN[0], l0, r0)
                     if stop_pressed() or ticks_diff(ticks_ms(), start) > RETURN_MAX_MS:
                         drive(0, 0, 0)
                         log("Line not found after the obstacle")
