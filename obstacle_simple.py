@@ -39,14 +39,14 @@ AROUND = [
     (50, 50, 1000),     # drive out, away from the line
     (-50, 50, 300),     # pivot left, back parallel to the line
     (50, 50, 2400),     # drive past the bottle
-    (-50, 50, 300),     # pivot left, about 45 degrees toward the line
+    (-50, 50, 180),     # pivot left, about 25 degrees toward the line (shallow, so it meets the line gently)
 ]
 # Straight steps (both powers equal) are kept straight with the wheel encoders.
-RETURN = (40, 40)       # then straight toward the line until the sensor sees it
+RETURN = (30, 30)       # then slowly straight toward the line until the sensor sees it
 STRAIGHT_K = 0.5        # power correction per wheel degree that one wheel is ahead
 STRAIGHT_MAX = 15       # max power correction
 STEP_PAUSE_MS = 250     # stop this long before every step, so each one starts from standstill
-RETURN_MAX_MS = 3000    # give up and stop if no line is found by then
+RETURN_MAX_MS = 6000    # give up and stop if no line is found by then (longer: shallow and slow)
 
 
 def log(message):
