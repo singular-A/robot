@@ -16,12 +16,12 @@ RIGHT_MOTOR = Port.M1
 
 # Line following (same regulator as line_follow_safe.py)
 BASE_POWER = 88     # forward power, 0-100 %
-KP = 1.0            # steering strength (line_follow_safe.py uses 1.2; lower = less wobble)
+KP = 1.15           # steering strength (line_follow_safe.py uses 1.2; lower = less wobble)
 KI = 0.01           # corrects steady drift in long curves
 KD = 7.0            # damping
 D_FILTER = 0.7      # derivative smoothing 0..1
 I_LIMIT = 50        # max steering power from the integral term
-SLOWDOWN = 1        # forward power lost per unit of error
+SLOWDOWN = 1.3      # forward power lost per unit of error
 SPEED_MEMORY = 0.95 # slows down at once, but speeds up again only gradually (no pulsing on straights)
 MIN_POWER = -25     # lowest wheel power
 LOST_TURN = 40      # steering power when only white is seen
