@@ -38,9 +38,9 @@ MIN_VALID_MM = 20   # readings below this are invalid (no target / too close): s
 # Tune the times on the track: longer turn = bigger angle, longer straight = further.
 AROUND = [
     (50, -50, 300),     # pivot right, about 45 degrees
-    (50, 50, 1000),     # drive out, away from the line
+    (50, 50, 1100),     # drive out, away from the line
     (-50, 50, 300),     # pivot left, back parallel to the line
-    (50, 50, 2400),     # drive past the bottle
+    (50, 50, 1300),     # drive past the bottle
     (-50, 50, 180),     # pivot left, about 25 degrees toward the line (shallow, so it meets the line gently)
 ]
 # Straight steps (both powers equal) are kept straight with the wheel encoders.
