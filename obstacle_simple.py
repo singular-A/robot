@@ -16,12 +16,13 @@ RIGHT_MOTOR = Port.M1
 
 # Line following (same regulator as line_follow_safe.py)
 BASE_POWER = 88     # forward power, 0-100 %
-KP = 1.2            # steering strength
+KP = 1.0            # steering strength (line_follow_safe.py uses 1.2; lower = less wobble)
 KI = 0.01           # corrects steady drift in long curves
 KD = 7.0            # damping
 D_FILTER = 0.7      # derivative smoothing 0..1
 I_LIMIT = 50        # max steering power from the integral term
 SLOWDOWN = 1        # forward power lost per unit of error
+SPEED_MEMORY = 0.95 # smoothing of that slowdown, so the speed does not pulse with every wobble
 MIN_POWER = -25     # lowest wheel power
 LOST_TURN = 40      # steering power when only white is seen
 PERIOD_MS = 10      # regulation period
@@ -30,6 +31,7 @@ CAL_POWER = 25      # pivot power while measuring white and black
 # Obstacle
 AVOID_MM = 300      # obstacle closer than this: drive around it
 CONFIRM = 3         # this many valid readings in a row before it reacts (ignores single glitches)
+LASER_EVERY = 3     # read the laser only every this many loops, so line following stays fast
 MIN_VALID_MM = 20   # readings below this are invalid (no target / too close): skipped, not counted
 
 # The move around the obstacle, step by step: (left power, right power, time in ms).
@@ -132,10 +134,13 @@ def run():
     close = 0            # valid readings in a row closer than AVOID_MM
     last_log = 0
     avoided = False
+    loops = 0
+    e_avg = 0            # smoothed |error|, for the slowdown
     last_tick = ticks_ms()
     while not stop_pressed():
         # Obstacle? (only until it has driven around one)
-        if not avoided:
+        loops += 1
+        if not avoided and loops % LASER_EVERY == 0:
             dist = laser.distance_fov()
             if dist >= MIN_VALID_MM:                 # invalid readings neither count nor reset
                 close = close + 1 if dist < AVOID_MM else 0
@@ -181,7 +186,8 @@ def run():
             if abs(u) > 2:
                 last_sign = 1 if u > 0 else -1
         slow = avoided and ticks_diff(now, back_at) < AFTER_MS
-        speed = max(0, (AFTER_POWER if slow else BASE_POWER) - SLOWDOWN * abs(e))
+        e_avg = SPEED_MEMORY * e_avg + (1 - SPEED_MEMORY) * abs(e)
+        speed = max(0, (AFTER_POWER if slow else BASE_POWER) - SLOWDOWN * e_avg)
         left.set_power(clamp(speed + u, MIN_POWER, 100))
         right.set_power(clamp(speed - u, MIN_POWER, 100))
         sleep_ms(PERIOD_MS)
