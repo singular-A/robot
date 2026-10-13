@@ -46,6 +46,8 @@ RETURN = (30, 30)       # then slowly straight toward the line until the sensor 
 STRAIGHT_K = 0.5        # power correction per wheel degree that one wheel is ahead
 STRAIGHT_MAX = 15       # max power correction
 STEP_PAUSE_MS = 250     # stop this long before every step, so each one starts from standstill
+AFTER_POWER = 50        # forward power right after the obstacle (a curve follows it)
+AFTER_MS = 5000         # how long it stays at AFTER_POWER after it is back on the line
 RETURN_MAX_MS = 6000    # give up and stop if no line is found by then (longer: shallow and slow)
 
 
@@ -157,6 +159,7 @@ def run():
                     sleep_ms(5)
                 log("Back on the line")
                 avoided = True
+                back_at = ticks_ms()
                 e_prev = d = integral = 0
                 last_sign = 1            # came in from the right: if it overshoots, turn right
                 last_tick = ticks_ms()
@@ -177,7 +180,8 @@ def run():
             u = KP * e + KI * integral + KD * d
             if abs(u) > 2:
                 last_sign = 1 if u > 0 else -1
-        speed = max(0, BASE_POWER - SLOWDOWN * abs(e))
+        slow = avoided and ticks_diff(now, back_at) < AFTER_MS
+        speed = max(0, (AFTER_POWER if slow else BASE_POWER) - SLOWDOWN * abs(e))
         left.set_power(clamp(speed + u, MIN_POWER, 100))
         right.set_power(clamp(speed - u, MIN_POWER, 100))
         sleep_ms(PERIOD_MS)
