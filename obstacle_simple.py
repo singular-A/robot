@@ -46,8 +46,8 @@ RETURN = (30, 30)       # then slowly straight toward the line until the sensor 
 STRAIGHT_K = 0.5        # power correction per wheel degree that one wheel is ahead
 STRAIGHT_MAX = 15       # max power correction
 STEP_PAUSE_MS = 250     # stop this long before every step, so each one starts from standstill
-AFTER_POWER = 50        # forward power right after the obstacle (a curve follows it)
-AFTER_MS = 5000         # how long it stays at AFTER_POWER after it is back on the line
+AFTER_POWER = 62        # forward power right after the obstacle (a curve follows it)
+AFTER_MS = 4000         # how long it stays at AFTER_POWER after it is back on the line
 RETURN_MAX_MS = 6000    # give up and stop if no line is found by then (longer: shallow and slow)
 
 
