@@ -51,8 +51,9 @@ WHEEL_CM = 8.16         # wheel diameter
 DEG_PER_CM = 360 / (3.1416 * WHEEL_CM)
 TURN_90_DEG = 210       # wheel degrees (each wheel) for a 90 degree pivot - tune with CALIBRATE
 
-POWER = 30              # driving power
-TURN_POWER = 30         # pivot power
+POWER = 45              # driving power (was 30)
+TURN_POWER = 40         # pivot power (was 30)
+PAUSE_MS = 50           # short stop before and after each pivot (was 100)
 TARGET_MM = 55          # lidar distance to the wall on the left when the robot is in the middle
 OPEN_MM = 150           # further than this = no wall on the left
 TRUST_MM = 100          # only readings up to this tell where the robot is, only if they
@@ -270,7 +271,7 @@ class Bot:
         mode = "pivR" if direction > 0 else "pivL"
         goal = TURN_90_DEG * part
         done = 0
-        sleep_ms(100)
+        sleep_ms(PAUSE_MS)
         for attempt in range(3):
             start, ref = self.pos(), self.pos()
             self.wheels(direction * TURN_POWER, -direction * TURN_POWER)
@@ -299,7 +300,7 @@ class Bot:
             else:
                 self.s, self.lat = self.lat, -self.s
         self.event("{} done {:.0f}/{:.0f} deg".format(mode, done, goal))
-        sleep_ms(100)
+        sleep_ms(PAUSE_MS)
         return True, done
 
     def move_cell(self):
