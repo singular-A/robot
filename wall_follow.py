@@ -6,28 +6,21 @@
 # Usage: put the robot in the middle of the start box C5, facing out of it (toward D5), and
 #        run. LEFT button = stop.
 #
-# The robot is too long to pivot in the middle of a cell that has a wall ahead (the bumper
-# touches the wall before the axle reaches the middle). So there are two kinds of turns:
-#   pivot   - on the spot, only in the middle of a cell with nothing ahead
-#   corner  - after the bumper touched a wall ahead: back up ARC_BACK_CM, then turn with the
-#             inner wheel standing still. That moves the axle forward and sideways during the
-#             turn, so it ends near the middle of the cell, facing the new way.
-# The robot keeps track of where it is in the cell grid along the corridor (p = axle position
-# from the middle of the current cell, cm, from the encoders), so it turns in the middle of
-# a cell. Every bump corrects p (the wall ahead is always at the end of a cell).
-#
-# Start: drive straight out of C5 until the bumper touches block E5, corner turn right
-# (now in D5 facing D6). The left-hand rule then turns left at D6 into E6 by itself.
-#
-# Left-hand rule:
-#   wall on the left        -> follow it at TARGET_MM
-#   opening on the left     -> drive on to the middle of that cell, turn left
-#   bumper pressed          -> corner turn left if the left is open, else right
+# 1. Start (fixed moves): C5 -> D5 -> D6 -> E6
+#    - straight out of C5 until the bumper touches block E5
+#    - corner turn right: back up ARC_BACK_CM, turn with the right wheel standing still
+#      (the robot is too long to pivot in D5 with E5 right in front of it)
+#    - straight to the middle of D6, pivot left, a little into E6: block E5 is on the left
+# 2. Then it just follows that one wall edge on its LEFT, all the way around:
+#    - wall on the left: keep TARGET_MM from it
+#    - the wall ends (corner of a block): drive on until the axle is at the corner, then
+#      curve left around it until the lidar sees the wall again
+#    - bumper touches a wall ahead (inside corner): corner turn right
 #
 # Log: saved on the cube in LOG_FILE (run read_log.py afterwards to print it to the Thonny
 # log panel). Events (EV ...) are also sent live over Bluetooth. Every LOG_MS one data line:
-#   D,time_ms,mode,lidar_mm,bump,left_enc,right_enc,left_power,right_power,p_cm
-#   mode: follow / invalid / open / gap / back / pivotL / pivotR / cornerL / cornerR / out
+#   D,time_ms,mode,lidar_mm,bump,left_enc,right_enc,left_power,right_power
+#   mode: out / back / cornerR / toD6 / pivotL / intoE6 / follow / invalid / open / tocorner / around
 #   Encoders in wheel degrees, powers as sent to the wheels in driving direction (+ = forward).
 from time import sleep_ms, ticks_ms, ticks_diff
 from lib.robot_consts import Sensor, Port, Button
@@ -47,16 +40,18 @@ TRACK_CM = 19.0         # distance between the middles of the two wheels - measu
 WHEEL_CM = 8.16         # wheel diameter
 DEG_PER_CM = 360 / (3.1416 * WHEEL_CM)
 TURN_90_DEG = 210       # wheel degrees each wheel turns for a 90 degree pivot - tune this first
-# When the bumper touches the wall ahead, the axle is BUMP_POS_CM from the middle of the cell
-# (-2.5: just before it). A corner turn moves the axle TRACK_CM / 2 forward and sideways, so
-# it backs up to -TRACK_CM / 2 first and ends in the middle.
-BUMP_POS_CM = CELL_CM / 2 - TOUCH_AHEAD_CM
-ARC_BACK_CM = BUMP_POS_CM + TRACK_CM / 2
+# Corner turn after a bump: when the bumper touches the wall ahead, the axle is
+# TOUCH_AHEAD_CM - CELL_CM / 2 (2.5 cm) short of the middle of the cell. The turn around the
+# inner wheel moves the axle TRACK_CM / 2 forward and sideways, so it first backs up to
+# TRACK_CM / 2 before the middle and ends in the middle.
+ARC_BACK_CM = TRACK_CM / 2 - (TOUCH_AHEAD_CM - CELL_CM / 2)
 
 # Wall following
 TARGET_MM = 55          # lidar distance to the left wall (robot about centred in the corridor)
 OPEN_MM = 150           # further than this = opening on the left
-OPEN_CONFIRM = 2        # this many readings in a row before it believes an opening
+OPEN_CONFIRM = 2        # this many readings in a row before it believes the wall ended
+AROUND_INNER = 0.2      # going around a block corner: left wheel power = this x right wheel power
+AROUND_MAX_DEG = 200    # give up curving around a corner after this many degrees of robot turn
 BASE_POWER = 30         # forward power
 KP = 0.4                # steering power per mm off the target
 KD = 3.0                # steering power per mm the distance changed since the last reading
@@ -69,7 +64,8 @@ TURN_POWER = 30
 STRAIGHT_K = 0.5        # straight moves: power correction per wheel degree one wheel is ahead
 STRAIGHT_MAX = 10       # max power correction
 STALL_MS = 600          # wheels hardly turned for this long while moving/turning = stuck
-START = True            # False: skip the start out of C5 (start anywhere, wall on the left)
+START = True            # False: skip the start (start anywhere, wall on the left)
+START_INTO_E6_CM = 5    # after the pivot in D6: this far, so the lidar is beside block E5
 
 LOG_MS = 40             # one data line every this many ms (25 per second)
 LOG_FILE = "wall_log.csv"   # on the cube; overwritten at every start
@@ -107,11 +103,6 @@ def run():
     power = [0, 0]          # last powers sent, in driving direction
     last_row = [0]
     last_flush = [0]
-    # p: axle position from the middle of the current cell along the driving direction, cm
-    # min_k: cells before this one (0 = the current cell) are ignored when looking for an
-    #        opening on the left (right after a turn, the left of the current cell is where
-    #        the robot came from)
-    st = {"p": 0.0, "min_k": 1}
 
     def wheels(left_power, right_power):
         power[0], power[1] = left_power, right_power
@@ -129,9 +120,9 @@ def run():
         last_row[0] = now
         if d is None:
             d = lidar.distance()
-        log("D,{},{},{},{},{},{},{:.0f},{:.0f},{:.1f}".format(
+        log("D,{},{},{},{},{},{},{:.0f},{:.0f}".format(
             ticks_diff(now, t0), mode, d, 1 if bumper.pressed() else 0,
-            left.position(), right.position(), power[0], power[1], st["p"]), live=False)
+            left.position(), right.position(), power[0], power[1]), live=False)
         if ticks_diff(now, last_flush[0]) >= 1000:   # save to flash about once a second
             log_file[0].flush()
             last_flush[0] = now
@@ -154,7 +145,7 @@ def run():
     def move(cm, move_power, mode):
         # Drive straight cm (power > 0 forward, < 0 back), kept straight with the encoders.
         # Returns True if it hit something going forward (bumper, or wheels stuck).
-        event("{} {:.1f} cm start (p {:.1f})".format(mode, cm, st["p"]))
+        event("{} {:.1f} cm start".format(mode, cm))
         l0, r0 = left.position(), right.position()
         progress = [0, ticks_ms()]
         sign = 1 if move_power > 0 else -1
@@ -174,8 +165,7 @@ def run():
             row(mode)
             sleep_ms(5)
         wheels(0, 0)
-        st["p"] += sign * travelled(l0, r0) / DEG_PER_CM
-        event("{} done {:.1f} cm (p {:.1f})".format(mode, travelled(l0, r0) / DEG_PER_CM, st["p"]))
+        event("{} done {:.1f} cm".format(mode, travelled(l0, r0) / DEG_PER_CM))
         row(mode, force=True)
         return hit
 
@@ -222,48 +212,61 @@ def run():
 
     def corner_turn(direction):
         # Called when the bumper touched the wall ahead
-        st["p"] = BUMP_POS_CM
         move(ARC_BACK_CM, -MOVE_POWER, "back")
         turn(direction, True)
-        st["p"] = TRACK_CM / 2           # the turn moved the axle this far in the new direction
-        st["min_k"] = 1
+
+    def around_corner():
+        # The wall on the left ended: curve left around its end until the lidar sees it again.
+        # Returns quietly; a bump on the way is handled by the main loop.
+        event("around start")
+        l0, r0 = left.position(), right.position()
+        wheels(MOVE_POWER * AROUND_INNER, MOVE_POWER)
+        seen = 0
+        while not stop_pressed() and not bumper.pressed():
+            # robot turn so far, degrees: (right - left wheel travel) / track
+            turned = (abs(right.position() - r0) - abs(left.position() - l0)) / DEG_PER_CM \
+                * 180 / 3.1416 / TRACK_CM
+            if turned > AROUND_MAX_DEG:
+                event("around: no wall found after {:.0f} deg".format(turned))
+                break
+            d = lidar.distance()
+            seen = seen + 1 if MIN_VALID_MM <= d <= OPEN_MM else 0
+            row("around", d)
+            if seen >= OPEN_CONFIRM:
+                event("around done: wall again at {} mm after {:.0f} deg".format(d, turned))
+                break
+            sleep_ms(10)
+        wheels(0, 0)
 
     sleep_ms(1000)
     log("CFG,TARGET_MM={},OPEN_MM={},BASE={},KP={},KD={},TURN_90_DEG={},TRACK_CM={},ARC_BACK_CM={}".format(
         TARGET_MM, OPEN_MM, BASE_POWER, KP, KD, TURN_90_DEG, TRACK_CM, ARC_BACK_CM))
-    log("HDR,D,time_ms,mode,lidar_mm,bump,left_enc,right_enc,left_power,right_power,p_cm")
+    log("HDR,D,time_ms,mode,lidar_mm,bump,left_enc,right_enc,left_power,right_power")
     t0 = ticks_ms()
     event("start")
 
     if START:
-        # Out of C5 until the bumper touches E5, then corner turn right (into D5, facing D6)
-        st["p"] = -CELL_CM              # roughly: the middle of C5, one cell before D5
-        if move(4 * CELL_CM, MOVE_POWER, "out"):
-            corner_turn(1)
+        event("start: C5 -> D5")
+        if move(4 * CELL_CM, MOVE_POWER, "out"):        # until the bumper touches E5
+            corner_turn(1)                               # now in D5, facing D6
+            move(CELL_CM - TRACK_CM / 2, MOVE_POWER, "toD6")   # to the middle of D6
+            turn(-1, False)                              # facing E6
+            move(START_INTO_E6_CM, MOVE_POWER, "intoE6")
+            event("start done, following the wall on the left")
         else:
-            event("WARNING: no wall found ahead after leaving C5")
+            event("WARNING: no wall ahead after leaving C5")
 
     d_prev = None
     open_count = 0
-    l_last, r_last = left.position(), right.position()
     while not stop_pressed():
-        # Where along the corridor is the axle (only forward moves while following)
-        l, r = left.position(), right.position()
-        st["p"] += (abs(l - l_last) + abs(r - r_last)) / 2 / DEG_PER_CM
-        l_last, r_last = l, r
-
-        # Wall ahead: corner turn, left if the left is open, else right
+        # Wall ahead (inside corner): corner turn right
         if bumper.pressed():
             wheels(0, 0)
-            d = lidar.distance()
-            left_open = d > OPEN_MM
-            event("bump at p {:.1f}, lidar {} mm -> corner {}".format(
-                st["p"], d, "left" if left_open else "right"))
-            row("follow", d, force=True)
-            corner_turn(-1 if left_open else 1)
+            event("bump -> corner turn right")
+            row("follow", force=True)
+            corner_turn(1)
             d_prev = None
             open_count = 0
-            l_last, r_last = left.position(), right.position()
             continue
 
         d = lidar.distance()
@@ -272,28 +275,17 @@ def run():
             sleep_ms(10)
             continue
 
-        # Opening on the left: which cell is the lidar next to? (k = 0 current, 1 next, ...)
-        k = round((st["p"] + LIDAR_AHEAD_CM) / CELL_CM)
-        if d > OPEN_MM and k >= st["min_k"]:
+        # The wall on the left ended (outside corner): drive on until the axle is at the
+        # corner (the lidar is LIDAR_AHEAD_CM ahead of it), then curve around it
+        if d > OPEN_MM:
             open_count += 1
             if open_count >= OPEN_CONFIRM:
-                to_go = k * CELL_CM - st["p"]
-                event("opening on the left ({} mm), cell +{}, {:.1f} cm to its middle".format(d, k, to_go))
+                event("wall ended ({} mm)".format(d))
                 row("open", d, force=True)
-                if to_go >= 0:
-                    hit = move(to_go, MOVE_POWER, "gap")
-                else:
-                    hit = False
-                    move(-to_go, -MOVE_POWER, "gap")
-                if hit:
-                    corner_turn(-1)                 # wall ahead there too
-                else:
-                    turn(-1, False)                 # pivot in the middle of the cell
-                    st["p"] = 0
-                    st["min_k"] = 1
+                if not move(LIDAR_AHEAD_CM, MOVE_POWER, "tocorner"):
+                    around_corner()
                 d_prev = None
                 open_count = 0
-                l_last, r_last = left.position(), right.position()
                 continue
             wheels(BASE_POWER, BASE_POWER)
             row("open", d)
@@ -301,7 +293,7 @@ def run():
             continue
         open_count = 0
 
-        # Follow the left wall: too far -> turn left, too close -> turn right
+        # Follow the wall: too far -> turn left, too close -> turn right
         change = 0 if d_prev is None else d - d_prev
         d_prev = d
         u = clamp(KP * (d - TARGET_MM) + KD * change, -TURN_MAX, TURN_MAX)
