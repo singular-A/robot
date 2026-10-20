@@ -15,12 +15,13 @@
 #    - wall on the left: keep TARGET_MM from it
 #    - the wall ends (corner of a block): drive on until the axle is at the corner, then
 #      curve left around it until the lidar sees the wall again
-#    - bumper touches a wall ahead (inside corner): corner turn right
+#    - bumper touches a wall ahead (inside corner): back up BUMP_BACK_CM, pivot 90 degrees
+#      right on the spot (one wheel forward, the other backward = the sharpest turn)
 #    - wheels stuck without the bumper pressed (e.g. the front-left corner hit a block):
-#      back up STUCK_BACK_CM and turn a little right
-#    - dead end (it bumps into a wall again during that corner turn): undo the turn, back out
-#      DEADEND_BACK_CM, turn around on the spot (swinging the front away from the wall on
-#      the left if there is one) and go on
+#      back up STUCK_BACK_CM, pivot 90 degrees right
+#    - dead end (it bumps into a wall again during that turn): undo the turn, back out to
+#      the middle of the cell before, turn around on the spot (swinging the front away from
+#      the wall on the left if there is one) and go on
 #
 # Log: printed to the console (Thonny Open-Cube log panel). Events start with EV, and every
 # LOG_MS one data line:
@@ -50,9 +51,9 @@ TURN_90_DEG = 210       # wheel degrees each wheel turns for a 90 degree pivot -
 # TOUCH_AHEAD_CM - CELL_CM / 2 (2.5 cm) short of the middle of the cell. The turn around the
 # inner wheel moves the axle TRACK_CM / 2 forward and sideways, so it first backs up to
 # TRACK_CM / 2 before the middle and ends in the middle.
-ARC_BACK_CM = TRACK_CM / 2 - (TOUCH_AHEAD_CM - CELL_CM / 2)
-# Dead end: after undoing the corner turn, back up this far = to the middle of the cell before
-DEADEND_BACK_CM = CELL_CM - TRACK_CM / 2
+BUMP_SHORT_CM = TOUCH_AHEAD_CM - CELL_CM / 2   # axle this far before the cell middle at a bump
+ARC_BACK_CM = TRACK_CM / 2 - BUMP_SHORT_CM
+BUMP_BACK_CM = 2        # in the maze: back up this far after a bump, then pivot right
 
 # Wall following
 TARGET_MM = 55          # lidar distance to the left wall (robot about centred in the corridor)
@@ -72,8 +73,7 @@ TURN_POWER = 30
 STRAIGHT_K = 0.5        # straight moves: power correction per wheel degree one wheel is ahead
 STRAIGHT_MAX = 10       # max power correction
 STALL_MS = 600          # wheels hardly turned for this long while moving/turning = stuck
-STUCK_BACK_CM = 4       # stuck while following (no bump): back up this far...
-STUCK_TURN = 0.35       # ...and pivot right this part of 90 degrees
+STUCK_BACK_CM = 4       # stuck while following (no bump): back up this far, then pivot right
 START = True            # False: skip the start (start anywhere, wall on the left)
 START_INTO_E6_CM = 5    # after the pivot in D6: this far, so the lidar is beside block E5
 
@@ -168,12 +168,14 @@ def run():
         row(mode, force=True)
         return hit
 
-    def turn(direction, arc, part=1.0):
-        # 90 degrees: direction +1 right, -1 left.
+    def turn(direction, arc, part=1.0, blockable=False):
+        # 90 degrees (or part of it): direction +1 right, -1 left.
         # arc False: pivot on the spot (both wheels, opposite ways).
-        # arc True: inner wheel stands still, outer wheel turns twice as far (corner turn).
-        #   A corner turn stops if the bumper touches a wall or the wheels get stuck on the way.
+        # arc True: inner wheel stands still, outer wheel turns twice as far.
+        # blockable (always for arcs): stop if the bumper touches a wall or the wheels get
+        #   stuck on the way, instead of backing up and retrying.
         # Returns (finished, wheel degrees done).
+        blockable = blockable or arc
         mode = ("corner" if arc else "pivot") + ("R" if direction > 0 else "L")
         sleep_ms(100)
         event("{} start".format(mode))
@@ -197,7 +199,7 @@ def run():
                     now_done = done + travelled(l0, r0)
                 if now_done >= goal or stalled(l0, r0, progress):
                     break
-                if arc and bumper.pressed():
+                if blockable and bumper.pressed() and now_done > 20:
                     break
                 row(mode)
                 sleep_ms(5)
@@ -205,7 +207,7 @@ def run():
             done = now_done
             if done >= goal or stop_pressed():
                 break
-            if arc:
+            if blockable:
                 event("{} blocked at {:.0f}/{} deg".format(mode, done, goal))
                 row(mode, force=True)
                 return False, done
@@ -218,30 +220,34 @@ def run():
         sleep_ms(100)
         return True, done
 
-    def corner_turn(direction):
-        # Called when the bumper touched the wall ahead
-        move(ARC_BACK_CM, -MOVE_POWER, "back")
-        finished, done = turn(direction, True)
+    def corner_turn(direction, arc):
+        # Called when the bumper touched the wall ahead.
+        # arc False: back up a little, pivot (sharpest turn). arc True: back up more, turn
+        # around the inner wheel (ends nearer the middle of the cell; used at the start).
+        back = ARC_BACK_CM if arc else BUMP_BACK_CM
+        move(back, -MOVE_POWER, "back")
+        finished, done = turn(direction, arc, blockable=True)
         if not finished and not stop_pressed():
-            dead_end(direction, done)
+            dead_end(direction, arc, done, back)
 
-    def dead_end(direction, done):
-        # The corner turn ran into a wall too: walls ahead and to the side
+    def dead_end(direction, arc, done, back):
+        # The turn ran into a wall too: walls ahead and to the side
         event("DEAD END -> undo the turn, back out, turn around")
-        # Undo the part of the corner turn that was done (outer wheel backward)
-        outer = left if direction > 0 else right
-        start = outer.position()
-        if direction > 0:
-            wheels(-TURN_POWER, 0)
+        # Undo the part of the turn that was done
+        if arc:
+            outer = left if direction > 0 else right
+            start = outer.position()
+            wheels(-TURN_POWER, 0) if direction > 0 else wheels(0, -TURN_POWER)
+            t_start = ticks_ms()
+            while abs(outer.position() - start) < done and ticks_diff(ticks_ms(), t_start) < 4000 \
+                    and not stop_pressed():
+                row("undo")
+                sleep_ms(5)
+            wheels(0, 0)
         else:
-            wheels(0, -TURN_POWER)
-        t_start = ticks_ms()
-        while abs(outer.position() - start) < done and ticks_diff(ticks_ms(), t_start) < 4000 \
-                and not stop_pressed():
-            row("undo")
-            sleep_ms(5)
-        wheels(0, 0)
-        move(DEADEND_BACK_CM, -MOVE_POWER, "deadback")
+            turn(-direction, False, done / TURN_90_DEG)
+        # Back out to the middle of the cell before
+        move(CELL_CM - BUMP_SHORT_CM - back, -MOVE_POWER, "deadback")
         # Turn around, swinging the front away from the wall on the left (if there is one)
         d = lidar.distance()
         side = 1 if MIN_VALID_MM <= d <= OPEN_MM else -1
@@ -282,7 +288,7 @@ def run():
     if START:
         event("start: C5 -> D5")
         if move(4 * CELL_CM, MOVE_POWER, "out"):        # until the bumper touches E5
-            corner_turn(1)                               # now in D5, facing D6
+            corner_turn(1, True)                         # now in D5, facing D6
             move(CELL_CM - TRACK_CM / 2, MOVE_POWER, "toD6")   # to the middle of D6
             turn(-1, False)                              # facing E6
             move(START_INTO_E6_CM, MOVE_POWER, "intoE6")
@@ -295,15 +301,15 @@ def run():
     stall = [left.position(), right.position(), ticks_ms()]   # last place it was moving
     while not stop_pressed():
         # Driving forward but the wheels do not turn: something touched the robot where the
-        # bumper is not (front-left corner, side). Back up a little, turn a little right.
+        # bumper is not (front-left corner, side). Back up a little, pivot right.
         if travelled(stall[0], stall[1]) > 5:
             stall[0], stall[1], stall[2] = left.position(), right.position(), ticks_ms()
         elif ticks_diff(ticks_ms(), stall[2]) > STALL_MS:
             wheels(0, 0)
-            event("STUCK without bump -> back up, turn a little right")
+            event("STUCK without bump -> back up, pivot right")
             row("follow", force=True)
             move(STUCK_BACK_CM, -MOVE_POWER, "back")
-            turn(1, False, STUCK_TURN)
+            turn(1, False)
             d_prev = None
             open_count = 0
             stall[0], stall[1], stall[2] = left.position(), right.position(), ticks_ms()
@@ -312,9 +318,9 @@ def run():
         # Wall ahead (inside corner): corner turn right
         if bumper.pressed():
             wheels(0, 0)
-            event("bump -> corner turn right")
+            event("bump -> back up, pivot right")
             row("follow", force=True)
-            corner_turn(1)
+            corner_turn(1, False)
             d_prev = None
             open_count = 0
             stall[0], stall[1], stall[2] = left.position(), right.position(), ticks_ms()
