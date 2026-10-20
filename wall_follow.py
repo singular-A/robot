@@ -16,11 +16,15 @@
 #    - the wall ends (corner of a block): drive on until the axle is at the corner, then
 #      curve left around it until the lidar sees the wall again
 #    - bumper touches a wall ahead (inside corner): corner turn right
+#    - dead end (it bumps into a wall again during that corner turn): undo the turn, back out
+#      DEADEND_BACK_CM, turn around on the spot (swinging the front away from the wall on
+#      the left if there is one) and go on
 #
-# Log: saved on the cube in LOG_FILE (run read_log.py afterwards to print it to the Thonny
-# log panel). Events (EV ...) are also sent live over Bluetooth. Every LOG_MS one data line:
+# Log: printed to the console (Thonny Open-Cube log panel). Events start with EV, and every
+# LOG_MS one data line:
 #   D,time_ms,mode,lidar_mm,bump,left_enc,right_enc,left_power,right_power
-#   mode: out / back / cornerR / toD6 / pivotL / intoE6 / follow / invalid / open / tocorner / around
+#   mode: out / back / cornerR / toD6 / pivotL / intoE6 / follow / invalid / open / tocorner /
+#         around / undo / deadback / pivotR
 #   Encoders in wheel degrees, powers as sent to the wheels in driving direction (+ = forward).
 from time import sleep_ms, ticks_ms, ticks_diff
 from lib.robot_consts import Sensor, Port, Button
@@ -45,6 +49,8 @@ TURN_90_DEG = 210       # wheel degrees each wheel turns for a 90 degree pivot -
 # inner wheel moves the axle TRACK_CM / 2 forward and sideways, so it first backs up to
 # TRACK_CM / 2 before the middle and ends in the middle.
 ARC_BACK_CM = TRACK_CM / 2 - (TOUCH_AHEAD_CM - CELL_CM / 2)
+# Dead end: after undoing the corner turn, back up this far = to the middle of the cell before
+DEADEND_BACK_CM = CELL_CM - TRACK_CM / 2
 
 # Wall following
 TARGET_MM = 55          # lidar distance to the left wall (robot about centred in the corridor)
@@ -67,20 +73,13 @@ STALL_MS = 600          # wheels hardly turned for this long while moving/turnin
 START = True            # False: skip the start (start anywhere, wall on the left)
 START_INTO_E6_CM = 5    # after the pivot in D6: this far, so the lidar is beside block E5
 
-LOG_MS = 40             # one data line every this many ms (25 per second)
-LOG_FILE = "wall_log.csv"   # on the cube; overwritten at every start
+LOG_MS = 100            # one data line every this many ms (10 per second)
 
 
-log_file = [None]
-
-
-def log(message, live=True):
-    # To the log file, and (live) also over Bluetooth to the Thonny log panel
-    if log_file[0]:
-        log_file[0].write(message + "\n")
-    if live:
-        robot.esp.bt_write(message + ";")
-        print(message)
+def log(message):
+    # To the console: over Bluetooth to the Thonny log panel, and USB
+    robot.esp.bt_write(message + ";")
+    print(message)
 
 
 def clamp(value, low, high):
@@ -102,7 +101,6 @@ def run():
     t0 = ticks_ms()
     power = [0, 0]          # last powers sent, in driving direction
     last_row = [0]
-    last_flush = [0]
 
     def wheels(left_power, right_power):
         power[0], power[1] = left_power, right_power
@@ -122,10 +120,7 @@ def run():
             d = lidar.distance()
         log("D,{},{},{},{},{},{},{:.0f},{:.0f}".format(
             ticks_diff(now, t0), mode, d, 1 if bumper.pressed() else 0,
-            left.position(), right.position(), power[0], power[1]), live=False)
-        if ticks_diff(now, last_flush[0]) >= 1000:   # save to flash about once a second
-            log_file[0].flush()
-            last_flush[0] = now
+            left.position(), right.position(), power[0], power[1]))
 
     def stop_pressed():
         return robot.buttons.pressed()[Button.LEFT]
@@ -173,6 +168,8 @@ def run():
         # 90 degrees: direction +1 right, -1 left.
         # arc False: pivot on the spot (both wheels, opposite ways).
         # arc True: inner wheel stands still, outer wheel turns twice as far (corner turn).
+        #   A corner turn stops if the bumper touches a wall or the wheels get stuck on the way.
+        # Returns (finished, wheel degrees done).
         mode = ("corner" if arc else "pivot") + ("R" if direction > 0 else "L")
         sleep_ms(100)
         event("{} start".format(mode))
@@ -196,12 +193,18 @@ def run():
                     now_done = done + travelled(l0, r0)
                 if now_done >= goal or stalled(l0, r0, progress):
                     break
+                if arc and bumper.pressed():
+                    break
                 row(mode)
                 sleep_ms(5)
             wheels(0, 0)
             done = now_done
             if done >= goal or stop_pressed():
                 break
+            if arc:
+                event("{} blocked at {:.0f}/{} deg".format(mode, done, goal))
+                row(mode, force=True)
+                return False, done
             # Stuck on something while turning: back up a little and finish the turn
             event("{} STUCK at {:.0f}/{} deg -> back up, retry".format(mode, done, goal))
             row(mode, force=True)
@@ -209,11 +212,38 @@ def run():
         event("{} done {:.0f}/{} deg".format(mode, done, goal))
         row(mode, force=True)
         sleep_ms(100)
+        return True, done
 
     def corner_turn(direction):
         # Called when the bumper touched the wall ahead
         move(ARC_BACK_CM, -MOVE_POWER, "back")
-        turn(direction, True)
+        finished, done = turn(direction, True)
+        if not finished and not stop_pressed():
+            dead_end(direction, done)
+
+    def dead_end(direction, done):
+        # The corner turn ran into a wall too: walls ahead and to the side
+        event("DEAD END -> undo the turn, back out, turn around")
+        # Undo the part of the corner turn that was done (outer wheel backward)
+        outer = left if direction > 0 else right
+        start = outer.position()
+        if direction > 0:
+            wheels(-TURN_POWER, 0)
+        else:
+            wheels(0, -TURN_POWER)
+        t_start = ticks_ms()
+        while abs(outer.position() - start) < done and ticks_diff(ticks_ms(), t_start) < 4000 \
+                and not stop_pressed():
+            row("undo")
+            sleep_ms(5)
+        wheels(0, 0)
+        move(DEADEND_BACK_CM, -MOVE_POWER, "deadback")
+        # Turn around, swinging the front away from the wall on the left (if there is one)
+        d = lidar.distance()
+        side = 1 if MIN_VALID_MM <= d <= OPEN_MM else -1
+        event("turn around {} (lidar {} mm)".format("right" if side > 0 else "left", d))
+        turn(side, False)
+        turn(side, False)
 
     def around_corner():
         # The wall on the left ended: curve left around its end until the lidar sees it again.
@@ -306,13 +336,10 @@ def run():
 
 
 try:
-    log_file[0] = open(LOG_FILE, "w")
     run()
 except Exception as ex:
     log("Crashed: {} {}".format(type(ex).__name__, ex))
     import sys
     sys.print_exception(ex)
-if log_file[0]:
-    log_file[0].close()
 robot.motors[Port.M1].set_power(0)
 robot.motors[Port.M2].set_power(0)
