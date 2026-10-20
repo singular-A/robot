@@ -16,6 +16,8 @@
 #    - the wall ends (corner of a block): drive on until the axle is at the corner, then
 #      curve left around it until the lidar sees the wall again
 #    - bumper touches a wall ahead (inside corner): corner turn right
+#    - wheels stuck without the bumper pressed (e.g. the front-left corner hit a block):
+#      back up STUCK_BACK_CM and turn a little right
 #    - dead end (it bumps into a wall again during that corner turn): undo the turn, back out
 #      DEADEND_BACK_CM, turn around on the spot (swinging the front away from the wall on
 #      the left if there is one) and go on
@@ -70,6 +72,8 @@ TURN_POWER = 30
 STRAIGHT_K = 0.5        # straight moves: power correction per wheel degree one wheel is ahead
 STRAIGHT_MAX = 10       # max power correction
 STALL_MS = 600          # wheels hardly turned for this long while moving/turning = stuck
+STUCK_BACK_CM = 4       # stuck while following (no bump): back up this far...
+STUCK_TURN = 0.35       # ...and pivot right this part of 90 degrees
 START = True            # False: skip the start (start anywhere, wall on the left)
 START_INTO_E6_CM = 5    # after the pivot in D6: this far, so the lidar is beside block E5
 
@@ -164,7 +168,7 @@ def run():
         row(mode, force=True)
         return hit
 
-    def turn(direction, arc):
+    def turn(direction, arc, part=1.0):
         # 90 degrees: direction +1 right, -1 left.
         # arc False: pivot on the spot (both wheels, opposite ways).
         # arc True: inner wheel stands still, outer wheel turns twice as far (corner turn).
@@ -178,7 +182,7 @@ def run():
             goal = 2 * TURN_90_DEG
             powers = (TURN_POWER, 0) if direction > 0 else (0, TURN_POWER)
         else:
-            goal = TURN_90_DEG
+            goal = TURN_90_DEG * part
             powers = (direction * TURN_POWER, -direction * TURN_POWER)
         done = 0                 # wheel degrees of the turn done so far
         for attempt in range(3):
@@ -288,7 +292,23 @@ def run():
 
     d_prev = None
     open_count = 0
+    stall = [left.position(), right.position(), ticks_ms()]   # last place it was moving
     while not stop_pressed():
+        # Driving forward but the wheels do not turn: something touched the robot where the
+        # bumper is not (front-left corner, side). Back up a little, turn a little right.
+        if travelled(stall[0], stall[1]) > 5:
+            stall[0], stall[1], stall[2] = left.position(), right.position(), ticks_ms()
+        elif ticks_diff(ticks_ms(), stall[2]) > STALL_MS:
+            wheels(0, 0)
+            event("STUCK without bump -> back up, turn a little right")
+            row("follow", force=True)
+            move(STUCK_BACK_CM, -MOVE_POWER, "back")
+            turn(1, False, STUCK_TURN)
+            d_prev = None
+            open_count = 0
+            stall[0], stall[1], stall[2] = left.position(), right.position(), ticks_ms()
+            continue
+
         # Wall ahead (inside corner): corner turn right
         if bumper.pressed():
             wheels(0, 0)
@@ -297,6 +317,7 @@ def run():
             corner_turn(1)
             d_prev = None
             open_count = 0
+            stall[0], stall[1], stall[2] = left.position(), right.position(), ticks_ms()
             continue
 
         d = lidar.distance()
@@ -316,6 +337,7 @@ def run():
                     around_corner()
                 d_prev = None
                 open_count = 0
+                stall[0], stall[1], stall[2] = left.position(), right.position(), ticks_ms()
                 continue
             wheels(BASE_POWER, BASE_POWER)
             row("open", d)
