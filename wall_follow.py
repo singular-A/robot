@@ -11,7 +11,13 @@
 #                              pivot left 90 degrees, go on
 #   bumper pressed          -> back up a little, pivot right 90 degrees, go on
 # Distances and turns are measured with the wheel encoders.
-from time import sleep_ms
+#
+# Log: every LOG_MS one data line, plus a line for every event (EV ...):
+#   D,time_ms,mode,lidar_mm,bump,left_enc,right_enc,left_power,right_power
+#   mode: follow / invalid (lidar reading skipped) / open (opening seen, not confirmed yet) /
+#   gap (driving to the middle of the opening) / turnL / turnR / back / skip.
+#   Encoders in wheel degrees, powers as sent to the wheels in driving direction (+ = forward).
+from time import sleep_ms, ticks_ms, ticks_diff
 from lib.robot_consts import Sensor, Port, Button
 
 # Motors: driving "backwards", so forward = negative power and the wheels swap sides.
@@ -42,6 +48,7 @@ MOVE_POWER = 30
 TURN_POWER = 30
 BACK_CM = 2             # back up after a bump, so the front clears the wall while pivoting
 SKIP_CM = 3             # after a left turn, drive this far before looking at the lidar again
+LOG_MS = 40             # one data line every this many ms (25 per second)
 
 
 def log(message):
@@ -65,9 +72,29 @@ def run():
     left.init_encoder()
     right.init_encoder()
 
+    t0 = ticks_ms()
+    power = [0, 0]          # last powers sent, in driving direction
+    last_row = [0]
+
     def wheels(left_power, right_power):
+        power[0], power[1] = left_power, right_power
         left.set_power(FORWARD * left_power)
         right.set_power(FORWARD * right_power)
+
+    def event(text):
+        log("EV,{},{}".format(ticks_diff(ticks_ms(), t0), text))
+
+    def row(mode, d=None, force=False):
+        # One data line, at most every LOG_MS (force: always)
+        now = ticks_ms()
+        if not force and ticks_diff(now, last_row[0]) < LOG_MS:
+            return
+        last_row[0] = now
+        if d is None:
+            d = lidar.distance()
+        log("D,{},{},{},{},{},{},{:.0f},{:.0f}".format(
+            ticks_diff(now, t0), mode, d, 1 if bumper.pressed() else 0,
+            left.position(), right.position(), power[0], power[1]))
 
     def stop_pressed():
         return robot.buttons.pressed()[Button.LEFT]
@@ -76,39 +103,54 @@ def run():
         # Wheel degrees turned since l0, r0 (average of both wheels, direction ignored)
         return (abs(left.position() - l0) + abs(right.position() - r0)) / 2
 
-    def move(cm, power):
+    def move(cm, move_power, mode):
         # Drive straight cm (power > 0 forward, < 0 back). Returns True if the bumper hit a wall.
+        event("{} {} cm start".format(mode, cm))
         l0, r0 = left.position(), right.position()
-        wheels(power, power)
+        wheels(move_power, move_power)
         while travelled(l0, r0) < cm * DEG_PER_CM and not stop_pressed():
-            if power > 0 and bumper.pressed():
+            if move_power > 0 and bumper.pressed():
                 wheels(0, 0)
+                event("{} bumped after {:.1f} cm".format(mode, travelled(l0, r0) / DEG_PER_CM))
+                row(mode, force=True)
                 return True
+            row(mode)
             sleep_ms(5)
         wheels(0, 0)
+        event("{} done {:.1f} cm".format(mode, travelled(l0, r0) / DEG_PER_CM))
+        row(mode, force=True)
         return False
 
     def turn(direction):
         # Pivot 90 degrees on the spot: +1 right, -1 left
+        mode = "turnR" if direction > 0 else "turnL"
         sleep_ms(100)
+        event("{} start".format(mode))
         l0, r0 = left.position(), right.position()
         wheels(direction * TURN_POWER, -direction * TURN_POWER)
         while travelled(l0, r0) < TURN_90_DEG and not stop_pressed():
+            row(mode)
             sleep_ms(5)
         wheels(0, 0)
+        event("{} done, wheels {} / {} deg".format(mode, left.position() - l0, right.position() - r0))
+        row(mode, force=True)
         sleep_ms(100)
 
     sleep_ms(1000)
-    log("start, lidar {} mm".format(lidar.distance()))
+    log("CFG,TARGET_MM={},OPEN_MM={},BASE={},KP={},KD={},TURN_90_DEG={},WHEEL_CM={}".format(
+        TARGET_MM, OPEN_MM, BASE_POWER, KP, KD, TURN_90_DEG, WHEEL_CM))
+    log("HDR,D,time_ms,mode,lidar_mm,bump,left_enc,right_enc,left_power,right_power")
+    t0 = ticks_ms()
+    event("start")
     d_prev = None
     open_count = 0
-    loops = 0
     while not stop_pressed():
         # Wall ahead: back up a little, turn right
         if bumper.pressed():
-            log("wall ahead -> right")
             wheels(0, 0)
-            move(BACK_CM, -MOVE_POWER)
+            event("bump -> back, turn right")
+            row("follow", force=True)
+            move(BACK_CM, -MOVE_POWER, "back")
             turn(1)
             d_prev = None
             open_count = 0
@@ -116,6 +158,7 @@ def run():
 
         d = lidar.distance()
         if d < MIN_VALID_MM:
+            row("invalid", d)
             sleep_ms(10)
             continue
 
@@ -123,15 +166,17 @@ def run():
         if d > OPEN_MM:
             open_count += 1
             if open_count >= 2:
-                log("opening on the left ({} mm) -> left".format(d))
-                if move(LIDAR_AHEAD_CM + CELL_CM / 2, MOVE_POWER):
-                    move(BACK_CM, -MOVE_POWER)      # wall ahead too: back up so it can pivot
+                event("opening on the left ({} mm) -> to its middle, turn left".format(d))
+                row("open", d, force=True)
+                if move(LIDAR_AHEAD_CM + CELL_CM / 2, MOVE_POWER, "gap"):
+                    move(BACK_CM, -MOVE_POWER, "back")      # wall ahead too: back up so it can pivot
                 turn(-1)
-                move(SKIP_CM, MOVE_POWER)
+                move(SKIP_CM, MOVE_POWER, "skip")
                 d_prev = None
                 open_count = 0
                 continue
             wheels(BASE_POWER, BASE_POWER)
+            row("open", d)
             sleep_ms(20)
             continue
         open_count = 0
@@ -141,14 +186,11 @@ def run():
         d_prev = d
         u = clamp(KP * (d - TARGET_MM) + KD * change, -TURN_MAX, TURN_MAX)
         wheels(BASE_POWER - u, BASE_POWER + u)
-
-        loops += 1
-        if loops % 25 == 0:
-            log("wall {} mm".format(d))
+        row("follow", d)
         sleep_ms(20)
 
     wheels(0, 0)
-    log("Stopped")
+    event("stopped")
 
 
 try:
