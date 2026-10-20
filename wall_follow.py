@@ -12,7 +12,8 @@
 #   bumper pressed          -> back up a little, pivot right 90 degrees, go on
 # Distances and turns are measured with the wheel encoders.
 #
-# Log: every LOG_MS one data line, plus a line for every event (EV ...):
+# Log: saved on the cube in LOG_FILE (run read_log.py afterwards to print it to the Thonny
+# log panel). Events (EV ...) are also sent live over Bluetooth. Every LOG_MS one data line:
 #   D,time_ms,mode,lidar_mm,bump,left_enc,right_enc,left_power,right_power
 #   mode: follow / invalid (lidar reading skipped) / open (opening seen, not confirmed yet) /
 #   gap (driving to the middle of the opening) / turnL / turnR / back / skip.
@@ -49,11 +50,20 @@ TURN_POWER = 30
 BACK_CM = 2             # back up after a bump, so the front clears the wall while pivoting
 SKIP_CM = 3             # after a left turn, drive this far before looking at the lidar again
 LOG_MS = 40             # one data line every this many ms (25 per second)
+LOG_FILE = "wall_log.csv"   # on the cube; overwritten at every start
+STALL_MS = 600          # wheels hardly turned for this long while moving/turning = stuck
 
 
-def log(message):
-    robot.esp.bt_write(message + ";")
-    print(message)
+log_file = [None]
+
+
+def log(message, live=True):
+    # To the log file, and (live) also over Bluetooth to the Thonny log panel
+    if log_file[0]:
+        log_file[0].write(message + "\n")
+    if live:
+        robot.esp.bt_write(message + ";")
+        print(message)
 
 
 def clamp(value, low, high):
@@ -75,6 +85,7 @@ def run():
     t0 = ticks_ms()
     power = [0, 0]          # last powers sent, in driving direction
     last_row = [0]
+    last_flush = [0]
 
     def wheels(left_power, right_power):
         power[0], power[1] = left_power, right_power
@@ -94,7 +105,10 @@ def run():
             d = lidar.distance()
         log("D,{},{},{},{},{},{},{:.0f},{:.0f}".format(
             ticks_diff(now, t0), mode, d, 1 if bumper.pressed() else 0,
-            left.position(), right.position(), power[0], power[1]))
+            left.position(), right.position(), power[0], power[1]), live=False)
+        if ticks_diff(now, last_flush[0]) >= 1000:   # save to flash about once a second
+            log_file[0].flush()
+            last_flush[0] = now
 
     def stop_pressed():
         return robot.buttons.pressed()[Button.LEFT]
@@ -103,10 +117,20 @@ def run():
         # Wheel degrees turned since l0, r0 (average of both wheels, direction ignored)
         return (abs(left.position() - l0) + abs(right.position() - r0)) / 2
 
+    def stalled(l0, r0, progress):
+        # progress = [last travelled value, time of last real progress]
+        t = travelled(l0, r0)
+        now = ticks_ms()
+        if t > progress[0] + 3:
+            progress[0], progress[1] = t, now
+        return ticks_diff(now, progress[1]) > STALL_MS
+
     def move(cm, move_power, mode):
-        # Drive straight cm (power > 0 forward, < 0 back). Returns True if the bumper hit a wall.
+        # Drive straight cm (power > 0 forward, < 0 back).
+        # Returns True if it hit something going forward (bumper, or wheels stuck).
         event("{} {} cm start".format(mode, cm))
         l0, r0 = left.position(), right.position()
+        progress = [0, ticks_ms()]
         wheels(move_power, move_power)
         while travelled(l0, r0) < cm * DEG_PER_CM and not stop_pressed():
             if move_power > 0 and bumper.pressed():
@@ -114,6 +138,11 @@ def run():
                 event("{} bumped after {:.1f} cm".format(mode, travelled(l0, r0) / DEG_PER_CM))
                 row(mode, force=True)
                 return True
+            if stalled(l0, r0, progress):
+                wheels(0, 0)
+                event("{} STUCK after {:.1f} cm".format(mode, travelled(l0, r0) / DEG_PER_CM))
+                row(mode, force=True)
+                return move_power > 0
             row(mode)
             sleep_ms(5)
         wheels(0, 0)
@@ -126,13 +155,25 @@ def run():
         mode = "turnR" if direction > 0 else "turnL"
         sleep_ms(100)
         event("{} start".format(mode))
-        l0, r0 = left.position(), right.position()
-        wheels(direction * TURN_POWER, -direction * TURN_POWER)
-        while travelled(l0, r0) < TURN_90_DEG and not stop_pressed():
-            row(mode)
-            sleep_ms(5)
-        wheels(0, 0)
-        event("{} done, wheels {} / {} deg".format(mode, left.position() - l0, right.position() - r0))
+        done = 0                 # wheel degrees of the turn done so far
+        for attempt in range(3):
+            l0, r0 = left.position(), right.position()
+            progress = [0, ticks_ms()]
+            wheels(direction * TURN_POWER, -direction * TURN_POWER)
+            while done + travelled(l0, r0) < TURN_90_DEG and not stop_pressed():
+                if stalled(l0, r0, progress):
+                    break
+                row(mode)
+                sleep_ms(5)
+            wheels(0, 0)
+            done += travelled(l0, r0)
+            if done >= TURN_90_DEG or stop_pressed():
+                break
+            # Stuck on something while turning: back up a little and finish the turn
+            event("{} STUCK at {:.0f}/{} deg -> back up, retry".format(mode, done, TURN_90_DEG))
+            row(mode, force=True)
+            move(BACK_CM, -MOVE_POWER, "back")
+        event("{} done {:.0f}/{} deg".format(mode, done, TURN_90_DEG))
         row(mode, force=True)
         sleep_ms(100)
 
@@ -194,10 +235,13 @@ def run():
 
 
 try:
+    log_file[0] = open(LOG_FILE, "w")
     run()
 except Exception as ex:
     log("Crashed: {} {}".format(type(ex).__name__, ex))
     import sys
     sys.print_exception(ex)
+if log_file[0]:
+    log_file[0].close()
 robot.motors[Port.M1].set_power(0)
 robot.motors[Port.M2].set_power(0)
